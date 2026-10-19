@@ -1,5 +1,8 @@
 node_modules/
 
+# Test coverage output
+coverage/
+
 # Environment files — never commit real secrets
 .env
 .env.*
@@ -7,6 +10,7 @@ node_modules/
 **/.env.*
 !**/.env.example
 !**/.env.template
+!**/.env.demo.template
 backend/.env
 frontend/.env
 dist/
@@ -25,6 +29,14 @@ Thumbs.db
 # Logs
 *.log
 npm-debug.log*
+
+# ESLint report output
+eslint.json
+eslint-report.json
+*.eslint.json
+
+# Deploy rollback marker (written by .github/workflows/deploy.yml on the host)
+.previous-deploy-sha
 
 # Agent / tool local config
 .claude/

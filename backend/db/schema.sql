@@ -33,21 +33,21 @@ CREATE TABLE campaigns (
   creator_id          UUID NOT NULL REFERENCES users(id),
   title               TEXT NOT NULL,
   description         TEXT,
-  target_amount       NUMERIC(20, 7) NOT NULL,
+  target_amount       NUMERIC(20, 7) NOT NULL CHECK (target_amount > 0),
   raised_amount       NUMERIC(20, 7) NOT NULL DEFAULT 0,
   asset_type          TEXT NOT NULL CHECK (asset_type IN ('XLM', 'USDC')),
   wallet_public_key   TEXT UNIQUE NOT NULL,
   status              TEXT NOT NULL DEFAULT 'active'
-                        CHECK (status IN ('active', 'funded', 'in_progress', 'completed', 'closed', 'withdrawn', 'failed', 'suspended')),
+                        CHECK (status IN ('active', 'funded', 'in_progress', 'completed', 'closed', 'withdrawn', 'failed', 'suspended', 'disputed')),
   deadline            DATE,
   show_backer_amounts BOOLEAN DEFAULT TRUE,
   category            TEXT CHECK (category IN (
                         'technology', 'community', 'arts', 'education',
                         'environment', 'health', 'business', 'open_source', 'other'
                       )),
-  min_contribution    NUMERIC(20, 7),
-  max_contribution    NUMERIC(20, 7),
-  max_per_user        NUMERIC(20, 7),
+  min_contribution    NUMERIC(20, 7) CHECK (min_contribution > 0),
+  max_contribution    NUMERIC(20, 7) CHECK (max_contribution > 0),
+  max_per_user        NUMERIC(20, 7) CHECK (max_per_user > 0),
   featured            BOOLEAN DEFAULT FALSE,
   featured_at         TIMESTAMPTZ,
   featured_note       TEXT,
@@ -57,7 +57,10 @@ CREATE TABLE campaigns (
   fraud_score         INTEGER DEFAULT 0,
   fraud_signals       JSONB DEFAULT '{}'::jsonb,
   share_count         INTEGER NOT NULL DEFAULT 0,
+  velocity_alert_threshold NUMERIC(18, 7) DEFAULT 0,
   country             TEXT,
+  draft_version       INTEGER NOT NULL DEFAULT 1,
+  draft_saved_at      TIMESTAMPTZ,
   created_at          TIMESTAMPTZ DEFAULT NOW()
 );
 CREATE TABLE IF NOT EXISTS campaign_updates (
@@ -65,13 +68,27 @@ CREATE TABLE IF NOT EXISTS campaign_updates (
   campaign_id UUID NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
   author_id UUID NOT NULL REFERENCES users(id),
   title TEXT NOT NULL,
-  body TEXT NOT NULL,
+  body TEXT NOT NULL CONSTRAINT campaign_updates_body_length CHECK (char_length(body) <= 5000),
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 CREATE INDEX IF NOT EXISTS campaign_updates_campaign_created_idx
   ON campaign_updates (campaign_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS campaign_draft_versions (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  campaign_id UUID NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
+  author_id   UUID REFERENCES users(id) ON DELETE SET NULL,
+  version     INTEGER NOT NULL,
+  reason      TEXT NOT NULL DEFAULT 'autosave'
+                CHECK (reason IN ('autosave', 'manual', 'restore')),
+  snapshot    JSONB NOT NULL,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS campaign_draft_versions_campaign_version_idx
+  ON campaign_draft_versions (campaign_id, version DESC);
 
 CREATE TABLE contributions (
   id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -89,9 +106,16 @@ CREATE TABLE contributions (
   source_asset        TEXT,
   conversion_rate     NUMERIC(30, 15),
   path                JSONB,
+  path_hops           JSONB,
+  effective_rate      NUMERIC(30, 15),
+  slippage_bps        INTEGER,
+  send_max            NUMERIC(20, 7),
+  retry_count         INTEGER NOT NULL DEFAULT 0,
+  diagnosis           TEXT,
   tx_hash             TEXT UNIQUE NOT NULL,  -- deduplicate by Stellar transaction hash
   display_name        VARCHAR(50),
   refunded            BOOLEAN NOT NULL DEFAULT FALSE,
+  refund_status       TEXT CHECK (refund_status IN ('partial', 'full')),
   platform_fee_amount NUMERIC(20, 7),
   ip_address          TEXT,
   device_fingerprint  TEXT,   -- salted HMAC of client device fingerprint (never raw)
@@ -168,18 +192,18 @@ CREATE INDEX idx_announcements_created_by ON platform_announcements (created_by)
 CREATE INDEX idx_announcements_current ON platform_announcements (active_from DESC)
   WHERE deactivated_at IS NULL;
 
-CREATE INDEX ON contributions (campaign_id);
+CREATE INDEX idx_contributions_campaign_id ON contributions (campaign_id);
 CREATE INDEX idx_contributions_campaign_unrefunded
   ON contributions (campaign_id)
   WHERE refunded = FALSE;
-CREATE INDEX ON contributions (tx_hash);
+CREATE INDEX idx_contributions_tx_hash ON contributions (tx_hash);
 CREATE UNIQUE INDEX contributions_anchor_transaction_idx
   ON contributions (anchor_id, anchor_transaction_id)
   WHERE anchor_transaction_id IS NOT NULL;
-CREATE INDEX ON campaigns (status);
-CREATE INDEX ON campaigns (creator_id);
-CREATE INDEX ON campaigns (category);
-CREATE INDEX ON campaigns (featured) WHERE featured = TRUE;
+CREATE INDEX idx_campaigns_status ON campaigns (status);
+CREATE INDEX idx_campaigns_creator_id ON campaigns (creator_id);
+CREATE INDEX idx_campaigns_category ON campaigns (category);
+CREATE INDEX idx_campaigns_featured ON campaigns (featured) WHERE featured = TRUE;
 CREATE UNIQUE INDEX users_kyc_provider_reference_idx
   ON users (kyc_provider_reference)
   WHERE kyc_provider_reference IS NOT NULL;
@@ -291,7 +315,8 @@ CREATE TABLE milestones (
   created_at      TIMESTAMPTZ DEFAULT NOW(),
   completed_at    TIMESTAMPTZ,
   approved_at     TIMESTAMPTZ,
-  released_at     TIMESTAMPTZ
+  released_at     TIMESTAMPTZ,
+  claimed_at      TIMESTAMPTZ
 );
 
 CREATE INDEX milestones_campaign_idx ON milestones (campaign_id);
@@ -405,19 +430,99 @@ CREATE INDEX idx_campaign_referrals_campaign_id ON campaign_referrals(campaign_i
 CREATE UNIQUE INDEX idx_campaign_referrals_code ON campaign_referrals(referral_code);
 CREATE UNIQUE INDEX idx_campaign_referrals_user_campaign ON campaign_referrals(campaign_id, referrer_user_id);
 
--- Feature flags for gradual rollouts, A/B tests, and kill switches
+-- Feature flags for incremental rollouts.
+-- Canonical shape: mirrors db/migrations/20260906_feature_flags.sql and the
+-- queries in src/routes/featureFlags.js (key / default_enabled), so a database
+-- bootstrapped from schema.sql and one built purely from migrations converge
+-- to the same table definition, seed data, and indexes (#800).
 CREATE TABLE feature_flags (
+  key             TEXT PRIMARY KEY,
+  enabled         BOOLEAN NOT NULL DEFAULT FALSE,
+  default_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+  description     TEXT,
+  updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Default flags (mirrors the migration's seed so both bootstrap paths agree)
+INSERT INTO feature_flags (key, enabled, default_enabled, description) VALUES
+  ('new_campaign_ui', false, false, 'Redesigned campaign creation flow'),
+  ('embed_widget_v2', false, false, 'Next-generation embed widget'),
+  ('recurring_donations', false, false, 'Monthly recurring contribution option'),
+  ('nft_rewards_v2', false, false, 'Enhanced NFT reward mechanics')
+ON CONFLICT (key) DO NOTHING;
+
+-- Failed payment records for ledger monitor retry/dead-letter
+CREATE TABLE failed_payment_records (
   id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  name              TEXT UNIQUE NOT NULL,
-  description       TEXT NOT NULL DEFAULT '',
-  enabled           BOOLEAN NOT NULL DEFAULT false,
-  rollout_pct       INTEGER CHECK (rollout_pct >= 0 AND rollout_pct <= 100),
-  target_roles      TEXT[],
-  target_user_ids   UUID[],
-  variants          JSONB NOT NULL DEFAULT '{}',
+  campaign_id       UUID NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
+  wallet_public_key TEXT NOT NULL,
+  payment_record    JSONB NOT NULL,
+  error_message     TEXT,
+  retry_count       INT NOT NULL DEFAULT 0,
   created_at        TIMESTAMPTZ DEFAULT NOW(),
   updated_at        TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE INDEX feature_flags_name_idx ON feature_flags (name);
-CREATE INDEX feature_flags_enabled_idx ON feature_flags (enabled) WHERE enabled = true;
+CREATE UNIQUE INDEX failed_payment_records_tx_campaign_idx
+  ON failed_payment_records ((payment_record->>'transaction_hash'), campaign_id);
+
+-- Embed tokens for public campaign embeds (Issue #455)
+CREATE TABLE embed_tokens (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  campaign_id UUID NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
+  creator_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  allowed_origins JSONB NOT NULL DEFAULT '[]'::jsonb,
+  expires_at TIMESTAMPTZ NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  last_used_at TIMESTAMPTZ NULL,
+  use_count INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX idx_embed_tokens_campaign_id ON embed_tokens(campaign_id);
+CREATE INDEX idx_embed_tokens_creator_id ON embed_tokens(creator_id);
+
+CREATE TABLE embed_contributions (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  campaign_id UUID NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
+  embed_token_id UUID NOT NULL REFERENCES embed_tokens(id) ON DELETE CASCADE,
+  amount NUMERIC(20, 7) NOT NULL,
+  asset VARCHAR(12) NOT NULL,
+  stellar_tx_hash VARCHAR(128) NULL,
+  contributor_ip_hash VARCHAR(64) NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_embed_contributions_campaign_id ON embed_contributions(campaign_id);
+CREATE INDEX idx_embed_contributions_token_id ON embed_contributions(embed_token_id);
+CREATE INDEX idx_embed_contributions_ip_hash_created ON embed_contributions(contributor_ip_hash, created_at);
+
+
+CREATE TABLE notification_preferences (
+  user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  campaign_updates BOOLEAN NOT NULL DEFAULT TRUE,
+  refunds BOOLEAN NOT NULL DEFAULT TRUE,
+  disputes BOOLEAN NOT NULL DEFAULT TRUE,
+  milestones BOOLEAN NOT NULL DEFAULT TRUE,
+  marketing BOOLEAN NOT NULL DEFAULT FALSE,
+  category_digest BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Category follows (#957): users subscribe to campaign categories and receive
+-- matching campaigns inside the weekly digest. Mirrors
+-- db/migrations/20260930_category_follows.sql so both bootstrap paths agree.
+CREATE TABLE IF NOT EXISTS category_follows (
+  user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  category    TEXT NOT NULL CHECK (category IN (
+                'technology', 'community', 'arts', 'education',
+                'environment', 'health', 'business', 'open_source', 'other'
+              )),
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (user_id, category)
+);
+
+CREATE INDEX IF NOT EXISTS category_follows_category_idx
+  ON category_follows (category);
+CREATE INDEX IF NOT EXISTS category_follows_user_idx
+  ON category_follows (user_id);

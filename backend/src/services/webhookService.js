@@ -2,6 +2,7 @@ const crypto = require('crypto');
 const db = require('../config/database');
 const logger = require('../config/logger');
 const { createNotification } = require('./notifications');
+const { server: horizonServer } = require('../config/stellar');
 
 // Event types accepted on the inbound webhook endpoint (POST /api/webhooks/incoming/:id).
 // These are distinct from the OUTBOUND events in webhookDispatcher.js — inbound
@@ -40,7 +41,9 @@ class WebhookError extends Error {
 function verifyWebhookSignature(secret, rawBody, headerSig) {
   if (!secret || !headerSig) return false;
 
-  const provided = String(headerSig).replace(/^sha256=/i, '').trim();
+  const provided = String(headerSig)
+    .replace(/^sha256=/i, '')
+    .trim();
   const expected = crypto.createHmac('sha256', secret).update(rawBody).digest('hex');
 
   // timingSafeEqual throws on length mismatch, so guard first. Both sides are
@@ -105,7 +108,7 @@ async function handleContributionConfirmed(ownerUserId, payload) {
     title: 'Contribution confirmed',
     body: `A contribution of ${contribution.amount} ${contribution.asset} to "${contribution.title}" was confirmed on-chain.`,
     link: `/campaigns/${contribution.campaign_id}`,
-  }).catch((err) => logger.error('contribution.confirmed notify failed', { error: err.message }));
+  }).catch(err => logger.error('contribution.confirmed notify failed', { error: err.message }));
 
   return { status: 200, body: { received: true, linked: true, contribution_id: contribution.id } };
 }
@@ -121,6 +124,81 @@ async function handleWithdrawalCompleted(ownerUserId, payload) {
   const txHash = payload.tx_hash || payload.txHash || null;
   if (!withdrawalId) {
     throw new WebhookError('withdrawal.completed requires withdrawal_id');
+  }
+
+  // Fetch withdrawal details for Stellar transaction verification
+  const { rows: withdrawalRows } = await db.query(
+    `SELECT wr.id, wr.amount, wr.destination_key, c.asset_type
+     FROM withdrawal_requests wr
+     JOIN campaigns c ON c.id = wr.campaign_id
+     WHERE wr.id = $1 AND c.creator_id = $2`,
+    [withdrawalId, ownerUserId]
+  );
+
+  if (!withdrawalRows.length) {
+    throw new WebhookError('Withdrawal not found', 404);
+  }
+
+  const withdrawal = withdrawalRows[0];
+
+  // Verify transaction on Stellar network when tx_hash is provided
+  if (txHash) {
+    let stellarTx;
+    try {
+      stellarTx = await horizonServer.transactions().transaction(txHash).call();
+    } catch (stellarErr) {
+      if (stellarErr.name === 'NotFoundError' || stellarErr.status === 404) {
+        throw new WebhookError('Transaction not found on Stellar network', 400);
+      }
+      logger.error('Stellar transaction verification failed', {
+        tx_hash: txHash,
+        error: stellarErr.message,
+      });
+      throw new WebhookError('Stellar network unavailable for verification', 503);
+    }
+
+    if (!stellarTx.successful) {
+      logger.warn('Webhook withdrawal.completed references failed Stellar transaction', {
+        withdrawal_id: withdrawalId,
+        tx_hash: txHash,
+      });
+      throw new WebhookError('Transaction failed on Stellar network', 400);
+    }
+
+    if (stellarTx.status === 'PENDING') {
+      throw new WebhookError('Transaction is still pending on Stellar network', 400);
+    }
+
+    // Verify payment operations match the stored withdrawal details
+    const operations = await horizonServer.operations().forTransaction(txHash).call();
+
+    const matched = (operations.records || []).some(op => {
+      if (op.type !== 'payment' && op.type !== 'path_payment_strict_receive') return false;
+
+      const opDest = op.to || op.destination;
+      if (opDest !== withdrawal.destination_key) return false;
+
+      const opAmount = String(op.amount || '0');
+      const expectedAmount = String(withdrawal.amount);
+      if (opAmount !== expectedAmount) return false;
+
+      // Verify asset matches
+      const opAsset = op.asset_type === 'native' ? 'XLM' : op.asset_code;
+      if (opAsset !== withdrawal.asset_type) return false;
+
+      return true;
+    });
+
+    if (!matched) {
+      logger.warn('Webhook withdrawal transaction fields mismatch withdrawal record', {
+        withdrawal_id: withdrawalId,
+        tx_hash: txHash,
+        expected_amount: withdrawal.amount,
+        expected_destination: withdrawal.destination_key,
+        expected_asset: withdrawal.asset_type,
+      });
+      throw new WebhookError('Transaction does not match withdrawal details', 400);
+    }
   }
 
   // Scope to the owner via campaign ownership.
@@ -157,7 +235,7 @@ async function handleWithdrawalCompleted(ownerUserId, payload) {
     title: 'Withdrawal completed',
     body: `Your withdrawal of ${wr.amount} was submitted on-chain.`,
     link: `/campaigns/${wr.campaign_id}`,
-  }).catch((err) => logger.error('withdrawal.completed notify failed', { error: err.message }));
+  }).catch(err => logger.error('withdrawal.completed notify failed', { error: err.message }));
 
   return { status: 200, body: { received: true, withdrawal_id: wr.id, status: wr.status } };
 }
@@ -280,9 +358,12 @@ async function handleMilestoneDecision(ownerUserId, payload, approved) {
       ? `Milestone "${milestone.title}" was approved.`
       : `Milestone "${milestone.title}" was rejected: ${reason}`,
     link: `/campaigns/${milestone.campaign_id}`,
-  }).catch((err) => logger.error('milestone decision notify failed', { error: err.message }));
+  }).catch(err => logger.error('milestone decision notify failed', { error: err.message }));
 
-  return { status: 200, body: { received: true, milestone_id: milestone.id, status: milestone.status } };
+  return {
+    status: 200,
+    body: { received: true, milestone_id: milestone.id, status: milestone.status },
+  };
 }
 
 /**
