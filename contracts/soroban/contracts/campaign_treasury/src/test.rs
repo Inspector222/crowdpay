@@ -573,3 +573,27 @@ fn uninitialized_calls_are_refused() {
         TreasuryError::NotInitialized
     );
 }
+
+#[test]
+#[should_panic]
+fn test_initialize_requires_platform_auth() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, CampaignTreasury);
+    let client = CampaignTreasuryClient::new(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let platform = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_id = env.register_stellar_asset_contract(token_admin);
+
+    client.initialize(
+        &symbol_short!("cp687"),
+        &creator,
+        &platform,
+        &None,
+        &policy(),
+        &DEADLINE,
+        &10_000,
+        &token_id,
+    );
+}

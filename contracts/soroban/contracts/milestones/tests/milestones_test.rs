@@ -10,7 +10,7 @@ fn make_milestone(env: &Env, title: &[u8; 32], bps: u32) -> Milestone {
         title_hash: BytesN::from_array(env, title),
         release_bps: bps,
         status: MilestoneStatus::Pending,
-        evidence_hash: None,
+        evidence_hash: BytesN::from_array(env, &[0u8; 32]),
     }
 }
 
@@ -49,7 +49,7 @@ impl MockEscrow {
 
     pub fn deposit(_env: Env, _from: Address, _amount: i128) {}
 
-    pub fn approve_withdrawal(env: Env, release_amount: i128) {
+    pub fn approve_withdrawal(env: Env, _to: Address, release_amount: i128) {
         let key = MockDataKey::ApprovedAmount;
         let current: i128 = env.storage().instance().get(&key).unwrap_or(0);
         env.storage().instance().set(&key, &(current + release_amount));
@@ -84,7 +84,7 @@ fn setup_milestones_contract(
     let platform = Address::generate(&env);
     let (token_addr, _) = install_token(&env);
 
-    let escrow_id = env.register(MockEscrow, ());
+    let escrow_id = env.register_contract(None, MockEscrow);
     let escrow_client = MockEscrowClient::new(&env, &escrow_id);
 
     escrow_client.initialize(
@@ -107,7 +107,7 @@ fn setup_milestones_contract(
         env.storage().instance().set(&asset_key, &token_addr);
     });
 
-    let contract_id = env.register(MilestonesContract, ());
+    let contract_id = env.register_contract(None, MilestonesContract);
     let client = MilestonesContractClient::new(&env, &contract_id);
 
     client.initialize(&creator, &platform, &escrow_id, &milestones);
@@ -123,9 +123,9 @@ fn setup_no_auth(
     let platform = Address::generate(&env);
     let token_addr = env.register_stellar_asset_contract(Address::generate(&env));
 
-    let escrow_id = env.register(MockEscrow, ());
+    let escrow_id = env.register_contract(None, MockEscrow);
     let escrow_client = MockEscrowClient::new(&env, &escrow_id);
-    escrow_client.initialize(
+    escrow_client.mock_all_auths().initialize(
         &platform,
         &1u64,
         &10000,
@@ -145,12 +145,31 @@ fn setup_no_auth(
         env.storage().instance().set(&asset_key, &token_addr);
     });
 
-    let contract_id = env.register(MilestonesContract, ());
+    let contract_id = env.register_contract(None, MilestonesContract);
     let client = MilestonesContractClient::new(&env, &contract_id);
 
-    client.initialize(&creator, &platform, &escrow_id, &milestones);
+    client.mock_all_auths().initialize(&creator, &platform, &escrow_id, &milestones);
 
     (contract_id, creator, platform)
+}
+
+#[test]
+fn test_initialize_requires_platform_auth() {
+    let env = Env::default();
+    let milestones = Vec::from_array(
+        &env,
+        [make_milestone(&env, b"INIT1111111111111111111111111111", 10000u32)],
+    );
+    let creator = Address::generate(&env);
+    let platform = Address::generate(&env);
+    let escrow_id = Address::generate(&env);
+    let contract_id = env.register_contract(None, MilestonesContract);
+    let client = MilestonesContractClient::new(&env, &contract_id);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.initialize(&creator, &platform, &escrow_id, &milestones);
+    }));
+    assert!(result.is_err());
 }
 
 #[test]
@@ -183,8 +202,8 @@ fn test_initialize_rejects_invalid_bps() {
     let creator = Address::generate(&env);
     let platform = Address::generate(&env);
     let (token_addr, _) = install_token(&env);
-    let escrow_id = env.register(MockEscrow, ());
-    let contract_id = env.register(MilestonesContract, ());
+    let escrow_id = env.register_contract(None, MockEscrow);
+    let contract_id = env.register_contract(None, MilestonesContract);
     let client = MilestonesContractClient::new(&env, &contract_id);
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -214,7 +233,7 @@ fn test_submit_milestone() {
 
     let milestone = client.get_milestone(&0u32);
     assert_eq!(milestone.status, MilestoneStatus::Submitted);
-    assert_eq!(milestone.evidence_hash, Some(evidence));
+    assert_eq!(milestone.evidence_hash, evidence);
 }
 
 #[test]
@@ -340,6 +359,54 @@ fn test_get_all_milestones() {
 }
 
 #[test]
+fn test_set_paused_blocks_submit_and_approve() {
+    let env = Env::default();
+    let milestones = Vec::from_array(
+        &env,
+        [make_milestone(&env, b"KKKK1111111111111111111111111111", 10000u32)],
+    );
+
+    let (contract_id, _creator, platform, _escrow) =
+        setup_milestones_contract(&env, milestones, 1000);
+    let client = MilestonesContractClient::new(&env, &contract_id);
+
+    client.set_paused(&true);
+    assert!(client.is_paused());
+
+    let evidence = BytesN::from_array(&env, b"evid_hash_1234567890123456789012");
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.submit_milestone(&0u32, &evidence);
+    }));
+    assert!(result.is_err());
+
+    client.set_paused(&false);
+    client.submit_milestone(&0u32, &evidence);
+
+    client.set_paused(&true);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.approve_milestone(&0u32);
+    }));
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_set_paused_rejects_non_platform() {
+    let env = Env::default();
+    let milestones = Vec::from_array(
+        &env,
+        [make_milestone(&env, b"LLLL1111111111111111111111111111", 10000u32)],
+    );
+
+    let (contract_id, _creator, _platform) = setup_no_auth(&env, milestones);
+    let client = MilestonesContractClient::new(&env, &contract_id);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.set_paused(&true);
+    }));
+    assert!(result.is_err());
+}
+
+#[test]
 fn test_resubmit_after_rejection() {
     let env = Env::default();
     let milestones = Vec::from_array(
@@ -362,5 +429,38 @@ fn test_resubmit_after_rejection() {
 
     let milestone = client.get_milestone(&0u32);
     assert_eq!(milestone.status, MilestoneStatus::Submitted);
-    assert_eq!(milestone.evidence_hash, Some(new_evidence));
+    assert_eq!(milestone.evidence_hash, new_evidence);
+}
+
+#[test]
+fn test_storage_ttl_outlives_default_ttl() {
+    use soroban_sdk::testutils::{storage::Instance as _, Ledger};
+    use milestones::STORAGE_TTL_LEDGERS;
+
+    let env = Env::default();
+    let milestones = Vec::from_array(
+        &env,
+        [
+            make_milestone(&env, b"TTTT1111111111111111111111111111", 5000u32),
+            make_milestone(&env, b"TTTT2222222222222222222222222222", 5000u32),
+        ],
+    );
+    let (contract_id, _creator, _platform, escrow_id) =
+        setup_milestones_contract(&env, milestones, 1000);
+    let client = MilestonesContractClient::new(&env, &contract_id);
+
+    env.as_contract(&contract_id, || {
+        assert!(env.storage().instance().get_ttl() >= STORAGE_TTL_LEDGERS - 1);
+    });
+
+    // Keep the mock escrow alive; only this contract's storage is under test.
+    let jump = env.ledger().get().min_persistent_entry_ttl * 100;
+    env.as_contract(&escrow_id, || {
+        env.storage().instance().extend_ttl(jump + 1000, jump + 1000);
+    });
+    env.ledger().with_mut(|li| li.sequence_number += jump);
+
+    let evidence = BytesN::from_array(&env, b"evid_hash_1234567890123456789012");
+    client.submit_milestone(&0u32, &evidence);
+    assert_eq!(client.get_milestone(&0u32).status, MilestoneStatus::Submitted);
 }
