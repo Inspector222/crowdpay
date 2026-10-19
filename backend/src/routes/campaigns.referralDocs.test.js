@@ -16,7 +16,7 @@ const spec = swaggerJsdoc({
       },
     },
   },
-  apis: [path.join(__dirname, '*.js')],
+  apis: [path.join(__dirname, '*.js').replace(/\\/g, '/')],
 });
 
 test('the campaign referral endpoints are documented in the OpenAPI spec', () => {
@@ -45,7 +45,7 @@ test('the authenticated referral endpoints declare bearer auth', () => {
   for (const [route, method] of authenticated) {
     const { security } = spec.paths[route][method];
     assert.ok(
-      Array.isArray(security) && security.some((s) => 'bearerAuth' in s),
+      Array.isArray(security) && security.some(s => 'bearerAuth' in s),
       `${method.toUpperCase()} ${route} should require bearerAuth`
     );
   }

@@ -26,12 +26,17 @@ describe('TransactionHistory', () => {
 
     renderWithProviders(<TransactionHistory campaignId="campaign-1" isCreator />);
 
-    await screen.findByText(/Transaction history/i);
-    expect(api.getStellarTransactions).toHaveBeenCalledWith({ campaignId: 'campaign-1', limit: 11 });
-    expect(screen.getByText(/HASH0000…000000/i)).toBeInTheDocument();
+    await screen.findByText(/HASH0000…000000/i);
+    expect(api.getStellarTransactions).toHaveBeenCalledWith({
+      campaignId: 'campaign-1',
+      limit: 11,
+    });
 
     await userEvent.click(screen.getByRole('button', { name: /Load more/i }));
     await waitFor(() => expect(api.getStellarTransactions).toHaveBeenCalledTimes(2));
-    expect(api.getStellarTransactions).toHaveBeenLastCalledWith({ campaignId: 'campaign-1', limit: 21 });
+    expect(api.getStellarTransactions).toHaveBeenLastCalledWith({
+      campaignId: 'campaign-1',
+      limit: 21,
+    });
   });
 });
