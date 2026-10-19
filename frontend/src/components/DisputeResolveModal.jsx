@@ -3,9 +3,11 @@ import RelativeTime from './RelativeTime';
 
 const OUTCOMES = [
   { value: '', label: '— Select an outcome —' },
-  { value: 'resolved_for_creator', label: 'Resolved for creator (funds released)' },
-  { value: 'resolved_for_contributor', label: 'Resolved for contributor (refund)' },
-  { value: 'dismissed', label: 'Dismissed (no action)' },
+  { value: 'release_to_creator', label: 'Release to creator (escrow unfrozen, funds released)' },
+  {
+    value: 'refund_contributors',
+    label: 'Refund contributors (proportional refund to all backers)',
+  },
 ];
 
 const MIN_NOTE_LENGTH = 20;
@@ -28,13 +30,6 @@ export default function DisputeResolveModal({ dispute, thread = [], onClose, onR
   const noteLength = note.trim().length;
   const noteShort = noteLength > 0 && noteLength < MIN_NOTE_LENGTH;
 
-  // Map UI outcome values → backend status values
-  const STATUS_MAP = {
-    resolved_for_creator: 'resolved_creator',
-    resolved_for_contributor: 'resolved_contributor',
-    dismissed: 'closed',
-  };
-
   async function handleSubmit(e) {
     e.preventDefault();
     setError('');
@@ -50,7 +45,7 @@ export default function DisputeResolveModal({ dispute, thread = [], onClose, onR
 
     setBusy(true);
     try {
-      await onResolve({ status: STATUS_MAP[outcome], resolution_note: note.trim() });
+      await onResolve({ decision: outcome, reason: note.trim() });
     } catch (err) {
       setError(err.message || 'Could not resolve dispute. Please try again.');
     } finally {
@@ -99,7 +94,9 @@ export default function DisputeResolveModal({ dispute, thread = [], onClose, onR
           </div>
           <div style={contextRowStyle}>
             <span style={contextLabelStyle}>Reason</span>
-            <span style={{ textTransform: 'capitalize' }}>{dispute.reason?.replace(/_/g, ' ')}</span>
+            <span style={{ textTransform: 'capitalize' }}>
+              {dispute.reason?.replace(/_/g, ' ')}
+            </span>
           </div>
           {dispute.description && (
             <div style={{ ...contextRowStyle, alignItems: 'flex-start' }}>
@@ -193,12 +190,7 @@ export default function DisputeResolveModal({ dispute, thread = [], onClose, onR
           )}
 
           <div style={{ display: 'flex', gap: '0.75rem', justifyContent: 'flex-end' }}>
-            <button
-              type="button"
-              className="btn-secondary"
-              onClick={onClose}
-              disabled={busy}
-            >
+            <button type="button" className="btn-secondary" onClick={onClose} disabled={busy}>
               Cancel
             </button>
             <button
