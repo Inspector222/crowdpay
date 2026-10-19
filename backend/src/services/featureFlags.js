@@ -88,7 +88,8 @@ const FLAGS = {
     allowedUserIds: null,
   },
   'scheduled-publish-cron': {
-    description: 'Enable the cron that auto-publishes draft campaigns at their scheduled_publish_at time',
+    description:
+      'Enable the cron that auto-publishes draft campaigns at their scheduled_publish_at time',
     envVar: 'ENABLE_SCHEDULED_PUBLISH_CRON',
     defaultValue: true,
     rolloutPct: null,
@@ -111,9 +112,42 @@ const FLAGS = {
     allowedRoles: null,
     allowedUserIds: null,
   },
+  'deadline-reminder-cron': {
+    description: 'Enable the cron that sends 48h and 12h deadline reminders',
+    envVar: 'ENABLE_DEADLINE_REMINDER_CRON',
+    defaultValue: true,
+    rolloutPct: null,
+    allowedRoles: null,
+    allowedUserIds: null,
+  },
   'notification-quiet-hours-cron': {
     description: 'Enable the hourly cron that flushes quiet-hours notification digests',
     envVar: 'ENABLE_NOTIFICATION_QUIET_HOURS_CRON',
+    defaultValue: true,
+    rolloutPct: null,
+    allowedRoles: null,
+    allowedUserIds: null,
+  },
+  'scheduled-campaign-updates-cron': {
+    description: 'Enable the cron that publishes scheduled campaign updates when due',
+    envVar: 'ENABLE_SCHEDULED_CAMPAIGN_UPDATES_CRON',
+    defaultValue: true,
+    rolloutPct: null,
+    allowedRoles: null,
+    allowedUserIds: null,
+  },
+  'recurring-payout-schedules-cron': {
+    description: 'Enable the cron that raises withdrawal requests for due creator payout schedules',
+    envVar: 'ENABLE_RECURRING_PAYOUT_SCHEDULES_CRON',
+    defaultValue: true,
+    rolloutPct: null,
+    allowedRoles: null,
+    allowedUserIds: null,
+  },
+  'milestone-auto-release-cron': {
+    description:
+      'Enable the cron that fires automatic milestone releases once their dispute window elapses (kill switch)',
+    envVar: 'ENABLE_MILESTONE_AUTO_RELEASE_CRON',
     defaultValue: true,
     rolloutPct: null,
     allowedRoles: null,
@@ -244,6 +278,18 @@ function isEnabled(flagName, context = {}) {
  * @returns {string|null} 'control', 'treatment', or null
  */
 function getVariant(flagName, context = {}) {
+  // External adapter takes precedence over static evaluation (same as isEnabled).
+  const adapter = adapters.get(flagName) || adapters.get('*');
+  if (adapter && typeof adapter.getVariant === 'function') {
+    const variant = adapter.getVariant(flagName, context);
+    if (!variant) return null;
+    if (typeof variant === 'object') {
+      if (variant.enabled === false) return null;
+      return typeof variant.name === 'string' && variant.name.length > 0 ? variant.name : null;
+    }
+    return typeof variant === 'string' && variant.length > 0 ? variant : null;
+  }
+
   if (!isEnabled(flagName, context)) return null;
 
   const flag = FLAGS[flagName];
